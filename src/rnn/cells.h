@@ -1065,6 +1065,104 @@ public:
   }
 };
 
+
+/** Implementation of [SRU++](https://arxiv.org/pdf/2102.12459.pdf)
+*/
+class SRUPP : public Cell {
+private:
+  Expr W_;
+  Expr Wr_, br_;
+  Expr Wf_, bf_;
+
+  float dropout_;
+  Expr dropMaskX_;
+
+  float layerNorm_;
+  Expr gamma_, gammaf_, gammar_;
+
+public:
+  SRUPP(Ptr<ExpressionGraph> graph, Ptr<Options> options) : Cell(options) {
+    int dimInput = opt<int>("dimInput");
+    int dimState = opt<int>("dimState");
+    std::string prefix = opt<std::string>("prefix");
+
+    ABORT_IF(dimInput != dimState,
+             "For SRU state and input dims have to be equal");
+
+    dropout_ = opt<float>("dropout", 0);
+    layerNorm_ = opt<bool>("layer-normalization", false);
+
+    W_ = graph->param(
+        prefix + "_W", {dimInput, dimInput}, inits::glorotUniform());
+
+    Wf_ = graph->param(
+        prefix + "_Wf", {dimInput, dimInput}, inits::glorotUniform());
+    bf_ = graph->param(prefix + "_bf", {1, dimInput}, inits::zeros());
+
+    Wr_ = graph->param(
+        prefix + "_Wr", {dimInput, dimInput}, inits::glorotUniform());
+    br_ = graph->param(prefix + "_br", {1, dimInput}, inits::zeros());
+
+    if(dropout_ > 0.0f) {
+      dropMaskX_ = graph->dropoutMask(dropout_, {1, dimInput});
+    }
+
+    if(layerNorm_) {
+      if(dimInput)
+        gamma_ = graph->param(prefix + "_gamma", {1, dimState}, inits::ones());
+      gammar_ = graph->param(prefix + "_gammar", {1, dimState}, inits::ones());
+      gammaf_ = graph->param(prefix + "_gammaf", {1, dimState}, inits::ones());
+    }
+  }
+
+  State apply(std::vector<Expr> inputs, State state, Expr mask = nullptr) {
+    return applyState(applyInput(inputs), state, mask);
+  }
+
+  std::vector<Expr> applyInput(std::vector<Expr> inputs) override {
+    ABORT_IF(inputs.empty(), "SRU expects input");
+
+    Expr input;
+    if(inputs.size() > 1)
+      input = concatenate(inputs, /*axis =*/ -1);
+    else
+      input = inputs.front();
+
+    auto inputDropped = dropout(input, dropMaskX_);
+
+    Expr x, f, r;
+    if(layerNorm_) {
+      x = layerNorm(dot(inputDropped, W_), gamma_);
+      f = layerNorm(dot(inputDropped, Wf_), gammaf_, bf_);
+      r = layerNorm(dot(inputDropped, Wr_), gammar_, br_);
+    } else {
+      x = dot(inputDropped, W_);
+      f = affine(inputDropped, Wf_, bf_);
+      r = affine(inputDropped, Wr_, br_);
+    }
+
+    return {x, f, r, input};
+  }
+
+  State applyState(std::vector<Expr> xWs, State state, Expr mask = nullptr) override {
+    auto recState = state.output;
+    auto cellState = state.cell;
+
+    auto x = xWs[0];
+    auto f = xWs[1];
+    auto r = xWs[2];
+    auto input = xWs[3];
+
+    auto nextCellState = highway(cellState, x, f);  // rename to "gate"?
+    auto nextState = highway(tanh(nextCellState), input, r);
+
+    auto maskedCellState = mask ? mask * nextCellState : nextCellState;
+    auto maskedState = mask ? mask * nextState : nextState;
+
+    return {maskedState, maskedCellState};
+  }
+};
+
 // class LSSRU : public Cell {
 // private:
 //   Expr W_;
